@@ -30,6 +30,12 @@ enum OllamaServiceError: LocalizedError {
 
 struct OllamaService: Sendable {
 
+    /// Normalized host root for cache keys and API paths (trim whitespace, no trailing slash).
+    static func normalizedBaseURL(_ baseURL: String) -> String {
+        baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
     static let humanizeSystemPrompt = """
     You rewrite text so it reads like a thoughtful human wrote it, not an AI.
     Preserve meaning and factual accuracy. Match the user’s approximate tone and register (casual vs formal) unless they gave almost no signal—then default to clear, direct prose.
@@ -42,8 +48,7 @@ struct OllamaService: Sendable {
         let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
 
-        let normalizedBase = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let normalizedBase = Self.normalizedBaseURL(baseURL)
         guard let root = URL(string: normalizedBase),
               let endpoint = URL(string: "api/chat", relativeTo: root)?.absoluteURL else {
             throw OllamaServiceError.invalidBaseURL(baseURL)
@@ -88,9 +93,51 @@ struct OllamaService: Sendable {
         }
         return content
     }
+
+    /// Lists installed model names from `GET /api/tags`.
+    func listModelNames(baseURL: String) async throws -> [String] {
+        let normalizedBase = Self.normalizedBaseURL(baseURL)
+        guard let root = URL(string: normalizedBase),
+              let endpoint = URL(string: "api/tags", relativeTo: root)?.absoluteURL else {
+            throw OllamaServiceError.invalidBaseURL(baseURL)
+        }
+
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "GET"
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let http = response as? HTTPURLResponse else {
+            throw OllamaServiceError.httpStatus(-1, nil)
+        }
+
+        if http.statusCode != 200 {
+            let snippet = String(data: data, encoding: .utf8)
+            if let errBody = try? JSONDecoder().decode(OllamaErrorEnvelope.self, from: data),
+               let msg = errBody.error, !msg.isEmpty {
+                throw OllamaServiceError.serverMessage(msg)
+            }
+            throw OllamaServiceError.httpStatus(http.statusCode, snippet)
+        }
+
+        let decoded = try JSONDecoder().decode(TagsResponse.self, from: data)
+        if let err = decoded.error, !err.isEmpty {
+            throw OllamaServiceError.serverMessage(err)
+        }
+        return (decoded.models ?? []).map(\.name).sorted()
+    }
 }
 
 // MARK: - Wire format
+
+private struct TagsResponse: Decodable {
+    let models: [TagModel]?
+    let error: String?
+
+    struct TagModel: Decodable {
+        let name: String
+    }
+}
 
 private struct ChatRequest: Encodable {
     let model: String

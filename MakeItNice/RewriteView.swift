@@ -16,7 +16,19 @@ struct RewriteView: View {
     @State private var errorMessage: String?
     @State private var connectionExpanded = false
 
+    @State private var availableModels: [String] = []
+    @State private var modelsLoadError: String?
+    @State private var isLoadingModels = false
+
     private let service = OllamaService()
+
+    /// Picker options: server list plus current selection so tags stay valid.
+    private var pickerModelNames: [String] {
+        var set = Set(availableModels)
+        let m = ollamaModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !m.isEmpty { set.insert(m) }
+        return set.sorted()
+    }
 
     var body: some View {
         Form {
@@ -24,8 +36,38 @@ struct RewriteView: View {
                 DisclosureGroup("Connection", isExpanded: $connectionExpanded) {
                     TextField("Base URL", text: $ollamaBaseURL)
                         .textFieldStyle(.roundedBorder)
-                    TextField("Model", text: $ollamaModel)
-                        .textFieldStyle(.roundedBorder)
+
+                    if pickerModelNames.isEmpty {
+                        TextField("Model", text: $ollamaModel)
+                            .textFieldStyle(.roundedBorder)
+                    } else {
+                        Picker("Model", selection: $ollamaModel) {
+                            ForEach(pickerModelNames, id: \.self) { name in
+                                Text(name).tag(name)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Refresh models") {
+                            Task { await loadModels(forceNetwork: true) }
+                        }
+                        .disabled(isLoadingModels || !isBaseURLValid)
+
+                        if isLoadingModels {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Spacer(minLength: 0)
+                    }
+
+                    if let modelsLoadError {
+                        Text(modelsLoadError)
+                            .foregroundStyle(.orange)
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
 
@@ -82,6 +124,14 @@ struct RewriteView: View {
         }
         .formStyle(.grouped)
         .padding(8)
+        .task(id: ollamaBaseURL) {
+            await loadModels(forceNetwork: false)
+        }
+    }
+
+    private var isBaseURLValid: Bool {
+        let key = OllamaService.normalizedBaseURL(ollamaBaseURL)
+        return URL(string: key) != nil
     }
 
     private var trimmedInput: String {
@@ -90,6 +140,48 @@ struct RewriteView: View {
 
     private var trimmedOutput: String {
         output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Loads from cache when fresh; fetches when missing, stale past TTL, or `forceNetwork`.
+    private func loadModels(forceNetwork: Bool) async {
+        let key = OllamaService.normalizedBaseURL(ollamaBaseURL)
+        guard URL(string: key) != nil else {
+            modelsLoadError = OllamaServiceError.invalidBaseURL(ollamaBaseURL).errorDescription
+            return
+        }
+
+        let cachedForKey: OllamaModelListCache? = {
+            guard let c = OllamaModelListCache.load(),
+                  OllamaService.normalizedBaseURL(c.baseURL) == key else { return nil }
+            return c
+        }()
+
+        if let c = cachedForKey {
+            availableModels = c.names
+            modelsLoadError = nil
+        } else if !forceNetwork {
+            availableModels = []
+        }
+
+        let withinTTL = cachedForKey.map { Date().timeIntervalSince($0.fetchedAt) <= OllamaModelListCache.ttl } ?? false
+        if !forceNetwork, withinTTL {
+            return
+        }
+
+        isLoadingModels = true
+        defer { isLoadingModels = false }
+
+        do {
+            let names = try await service.listModelNames(baseURL: ollamaBaseURL)
+            availableModels = names
+            OllamaModelListCache(baseURL: key, names: names, fetchedAt: Date()).save()
+            modelsLoadError = nil
+        } catch {
+            modelsLoadError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            if cachedForKey == nil {
+                availableModels = []
+            }
+        }
     }
 
     private func runRewrite() async {
