@@ -10,12 +10,9 @@ import SwiftUI
 @main
 struct MakeItNiceApp: App {
     var body: some Scene {
-//        WindowGroup {
-//            ContentView()
-//        }
-        
-        MenuBarExtra("Make It Nice", systemImage: "bolt.fill"){
-           
+        MenuBarExtra("Make It Nice", systemImage: "bolt.fill") {
+            RewriteView()
+                .frame(minWidth: 360, minHeight: 460)
         }
         .menuBarExtraStyle(.window)
     }
