@@ -20,6 +20,9 @@ struct RewriteView: View {
     @State private var modelsLoadError: String?
     @State private var isLoadingModels = false
 
+    /// Duration of the last successful rewrite; shown in the Results header.
+    @State private var lastRewriteDuration: TimeInterval?
+
     private let service = OllamaService()
 
     /// Picker options: server list plus current selection so tags stay valid.
@@ -30,8 +33,30 @@ struct RewriteView: View {
         return set.sorted()
     }
 
+    private var resultsSectionTitle: String {
+        if let d = lastRewriteDuration {
+            return "Results (\(Self.formatRewriteDuration(d)))"
+        }
+        return "Results"
+    }
+
     var body: some View {
-        Form {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 10) {
+                Image("BrandMark")
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 32, height: 32)
+                    .accessibilityHidden(true)
+                Text("Make It Nice")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 4)
+
+            Form {
             Section {
                 DisclosureGroup("Connection", isExpanded: $connectionExpanded) {
                     TextField("Base URL", text: $ollamaBaseURL)
@@ -99,7 +124,7 @@ struct RewriteView: View {
                 }
             }
 
-            Section("Result") {
+            Section {
                 ScrollView {
                     Text(output.isEmpty ? " " : output)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -118,8 +143,12 @@ struct RewriteView: View {
                         input = ""
                         output = ""
                         errorMessage = nil
+                        lastRewriteDuration = nil
                     }
                 }
+            } header: {
+                Text(resultsSectionTitle)
+            }
             }
         }
         .formStyle(.grouped)
@@ -188,15 +217,32 @@ struct RewriteView: View {
         isLoading = true
         errorMessage = nil
         defer { isLoading = false }
+        let started = Date()
         do {
             output = try await service.rewriteHumanized(
                 userText: input,
                 baseURL: ollamaBaseURL,
                 model: ollamaModel
             )
+            lastRewriteDuration = Date().timeIntervalSince(started)
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    /// Human-readable duration for the section title (e.g. `1 Second`, `2.4 Seconds`, `240 ms`).
+    private static func formatRewriteDuration(_ seconds: TimeInterval) -> String {
+        let s = max(seconds, 0)
+        if s < 1 {
+            let ms = max(1, Int((s * 1000).rounded(.toNearestOrAwayFromZero)))
+            return "\(ms) ms"
+        }
+        let rounded = s.rounded(.toNearestOrAwayFromZero)
+        if abs(s - rounded) < 0.05 {
+            let n = Int(rounded)
+            return n == 1 ? "1 Second" : "\(n) Seconds"
+        }
+        return String(format: "%.1f Seconds", s)
     }
 
     private func copyOutput() {
