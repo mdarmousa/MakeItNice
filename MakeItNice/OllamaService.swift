@@ -44,9 +44,16 @@ struct OllamaService: Sendable {
     Output only the rewritten text.
     """
 
-    func rewriteHumanized(userText: String, baseURL: String, model: String) async throws -> String {
+    /// Streams assistant text from `POST /api/chat` with `stream: true` (newline-delimited JSON).
+    /// Calls `onDelta` with each non-empty `message.content` fragment in order.
+    func rewriteHumanizedStreaming(
+        userText: String,
+        baseURL: String,
+        model: String,
+        onDelta: @Sendable @escaping (String) async -> Void
+    ) async throws {
         let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
+        guard !trimmed.isEmpty else { return }
 
         let normalizedBase = Self.normalizedBaseURL(baseURL)
         guard let root = URL(string: normalizedBase),
@@ -56,7 +63,7 @@ struct OllamaService: Sendable {
 
         let payload = ChatRequest(
             model: model.trimmingCharacters(in: .whitespacesAndNewlines),
-            stream: false,
+            stream: true,
             messages: [
                 .init(role: "system", content: Self.humanizeSystemPrompt),
                 .init(role: "user", content: trimmed),
@@ -68,30 +75,61 @@ struct OllamaService: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(payload)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
 
         guard let http = response as? HTTPURLResponse else {
             throw OllamaServiceError.httpStatus(-1, nil)
         }
 
         if http.statusCode != 200 {
-            let snippet = String(data: data, encoding: .utf8)
-            if let errBody = try? JSONDecoder().decode(OllamaErrorEnvelope.self, from: data),
+            var acc = Data()
+            acc.reserveCapacity(4096)
+            for try await b in bytes {
+                acc.append(b)
+                if acc.count > 65_536 { break }
+            }
+            let snippet = String(data: acc, encoding: .utf8)
+            if let errBody = try? JSONDecoder().decode(OllamaErrorEnvelope.self, from: acc),
                let msg = errBody.error, !msg.isEmpty {
                 throw OllamaServiceError.serverMessage(msg)
             }
             throw OllamaServiceError.httpStatus(http.statusCode, snippet)
         }
 
-        let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
-        if let err = decoded.error, !err.isEmpty {
-            throw OllamaServiceError.serverMessage(err)
+        var lineBuffer = Data()
+        var sawAnyContent = false
+
+        func flushLine() async throws {
+            defer { lineBuffer.removeAll(keepingCapacity: true) }
+            guard !lineBuffer.isEmpty,
+                  let line = String(data: lineBuffer, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !line.isEmpty else { return }
+
+            guard let lineData = line.data(using: .utf8) else { return }
+            let chunk = try JSONDecoder().decode(ChatStreamChunk.self, from: lineData)
+            if let err = chunk.error, !err.isEmpty {
+                throw OllamaServiceError.serverMessage(err)
+            }
+            if let piece = chunk.message?.content, !piece.isEmpty {
+                await onDelta(piece)
+                sawAnyContent = true
+            }
         }
-        guard let content = decoded.message?.content?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !content.isEmpty else {
+
+        for try await byte in bytes {
+            if byte == 13 { continue }
+            if byte == 10 {
+                try await flushLine()
+            } else {
+                lineBuffer.append(byte)
+            }
+        }
+        try await flushLine()
+
+        if !sawAnyContent {
             throw OllamaServiceError.emptyResponse
         }
-        return content
     }
 
     /// Lists installed model names from `GET /api/tags`.
@@ -150,12 +188,11 @@ private struct ChatMessage: Encodable {
     let content: String
 }
 
-private struct ChatResponse: Decodable {
-    let message: AssistantMessage?
+private struct ChatStreamChunk: Decodable {
+    let message: StreamAssistantMessage?
     let error: String?
 
-    struct AssistantMessage: Decodable {
-        let role: String?
+    struct StreamAssistantMessage: Decodable {
         let content: String?
     }
 }

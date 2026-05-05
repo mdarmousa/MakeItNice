@@ -40,21 +40,24 @@ struct RewriteView: View {
         return "Results"
     }
 
+    /// Header / footer chrome: same SF Symbol and title as the menu bar app uses.
+    private var brandChromeRow: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "bolt.fill")
+                .font(.title2)
+                .symbolRenderingMode(.hierarchical)
+                .accessibilityHidden(true)
+            Text("Make It Nice")
+                .font(.title2)
+                .fontWeight(.semibold)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 4)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .center, spacing: 10) {
-                Image("BrandMark")
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 32, height: 32)
-                    .accessibilityHidden(true)
-                Text("Make It Nice")
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 4)
+            brandChromeRow
 
             Form {
             Section {
@@ -150,6 +153,9 @@ struct RewriteView: View {
                 Text(resultsSectionTitle)
             }
             }
+
+            brandChromeRow
+                .padding(.top, 4)
         }
         .formStyle(.grouped)
         .padding(8)
@@ -216,14 +222,19 @@ struct RewriteView: View {
     private func runRewrite() async {
         isLoading = true
         errorMessage = nil
+        output = ""
         defer { isLoading = false }
         let started = Date()
         do {
-            output = try await service.rewriteHumanized(
+            try await service.rewriteHumanizedStreaming(
                 userText: input,
                 baseURL: ollamaBaseURL,
                 model: ollamaModel
-            )
+            ) { delta in
+                await MainActor.run {
+                    output += delta
+                }
+            }
             lastRewriteDuration = Date().timeIntervalSince(started)
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
