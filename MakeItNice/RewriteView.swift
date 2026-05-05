@@ -9,6 +9,8 @@ import SwiftUI
 struct RewriteView: View {
     @AppStorage("ollamaBaseURL") private var ollamaBaseURL = "http://127.0.0.1:11434"
     @AppStorage("ollamaModel") private var ollamaModel = "gemma4"
+    /// Ollama Cloud: create at ollama.com/settings/keys — required only for `https://ollama.com` direct API.
+    @AppStorage("ollamaAPIKey") private var ollamaAPIKey = ""
 
     @State private var input = ""
     @State private var output = ""
@@ -20,10 +22,20 @@ struct RewriteView: View {
     @State private var modelsLoadError: String?
     @State private var isLoadingModels = false
 
+    @FocusState private var focusedField: FocusedField?
+
     /// Duration of the last successful rewrite; shown in the Results header.
     @State private var lastRewriteDuration: TimeInterval?
 
+    /// Skips debounced rewrite when setting `input` from the ⌘F selection pipeline.
+    @State private var suppressDebouncedRewrite = false
+    @State private var inputDebounceTask: Task<Void, Never>?
+
     private let service = OllamaService()
+
+    private enum FocusedField: Hashable {
+        case draft
+    }
 
     /// Picker options: server list plus current selection so tags stay valid.
     private var pickerModelNames: [String] {
@@ -31,6 +43,11 @@ struct RewriteView: View {
         let m = ollamaModel.trimmingCharacters(in: .whitespacesAndNewlines)
         if !m.isEmpty { set.insert(m) }
         return set.sorted()
+    }
+
+    private var connectionTaskIdentity: String {
+        let fp = OllamaService.apiKeyFingerprint(ollamaAPIKey)
+        return "\(OllamaService.normalizedBaseURL(ollamaBaseURL))|\(fp)"
     }
 
     private var resultsSectionTitle: String {
@@ -64,6 +81,22 @@ struct RewriteView: View {
                 DisclosureGroup("Connection", isExpanded: $connectionExpanded) {
                     TextField("Base URL", text: $ollamaBaseURL)
                         .textFieldStyle(.roundedBorder)
+
+                    SecureField("API key (Ollama Cloud only)", text: $ollamaAPIKey)
+                        .textFieldStyle(.roundedBorder)
+
+                    Text("Local Ollama: leave API key empty. Cloud: set Base URL to https://ollama.com and paste your key from ollama.com/settings/keys.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 8) {
+                        Button("Use Ollama Cloud") {
+                            ollamaBaseURL = "https://ollama.com"
+                            connectionExpanded = true
+                        }
+                        Spacer(minLength: 0)
+                    }
 
                     if pickerModelNames.isEmpty {
                         TextField("Model", text: $ollamaModel)
@@ -103,6 +136,7 @@ struct RewriteView: View {
                 TextEditor(text: $input)
                     .font(.body)
                     .frame(minHeight: 120)
+                    .focused($focusedField, equals: .draft)
             }
 
             Section {
@@ -159,8 +193,27 @@ struct RewriteView: View {
         }
         .formStyle(.grouped)
         .padding(8)
-        .task(id: ollamaBaseURL) {
+        .task(id: connectionTaskIdentity) {
             await loadModels(forceNetwork: false)
+        }
+        .onChange(of: input) { _, _ in
+            guard !suppressDebouncedRewrite else { return }
+            inputDebounceTask?.cancel()
+            inputDebounceTask = Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(650))
+                guard !Task.isCancelled else { return }
+                await runDebouncedRewriteAfterInputChange()
+            }
+        }
+        .onAppear {
+            AppActionCenter.shared.registerSelectionPipeline { text in
+                Task { await applySelectionFromHotKey(text) }
+            }
+        }
+        .onDisappear {
+            inputDebounceTask?.cancel()
+            inputDebounceTask = nil
+            AppActionCenter.shared.clearRegistration()
         }
     }
 
@@ -180,6 +233,7 @@ struct RewriteView: View {
     /// Loads from cache when fresh; fetches when missing, stale past TTL, or `forceNetwork`.
     private func loadModels(forceNetwork: Bool) async {
         let key = OllamaService.normalizedBaseURL(ollamaBaseURL)
+        let authPrint = OllamaService.apiKeyFingerprint(ollamaAPIKey)
         guard URL(string: key) != nil else {
             modelsLoadError = OllamaServiceError.invalidBaseURL(ollamaBaseURL).errorDescription
             return
@@ -187,7 +241,8 @@ struct RewriteView: View {
 
         let cachedForKey: OllamaModelListCache? = {
             guard let c = OllamaModelListCache.load(),
-                  OllamaService.normalizedBaseURL(c.baseURL) == key else { return nil }
+                  OllamaService.normalizedBaseURL(c.baseURL) == key,
+                  c.apiKeyFingerprint == authPrint else { return nil }
             return c
         }()
 
@@ -207,9 +262,14 @@ struct RewriteView: View {
         defer { isLoadingModels = false }
 
         do {
-            let names = try await service.listModelNames(baseURL: ollamaBaseURL)
+            let names = try await service.listModelNames(baseURL: ollamaBaseURL, apiKey: ollamaAPIKey)
             availableModels = names
-            OllamaModelListCache(baseURL: key, names: names, fetchedAt: Date()).save()
+            OllamaModelListCache(
+                baseURL: key,
+                apiKeyFingerprint: authPrint,
+                names: names,
+                fetchedAt: Date()
+            ).save()
             modelsLoadError = nil
         } catch {
             modelsLoadError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -219,7 +279,31 @@ struct RewriteView: View {
         }
     }
 
+    private func applySelectionFromHotKey(_ text: String) async {
+        suppressDebouncedRewrite = true
+        input = text
+        suppressDebouncedRewrite = false
+        focusedField = .draft
+        await runRewrite()
+    }
+
+    private func runDebouncedRewriteAfterInputChange() async {
+        guard !trimmedInput.isEmpty else {
+            output = ""
+            errorMessage = nil
+            lastRewriteDuration = nil
+            return
+        }
+        await runRewrite()
+    }
+
     private func runRewrite() async {
+        guard !trimmedInput.isEmpty else {
+            output = ""
+            errorMessage = nil
+            lastRewriteDuration = nil
+            return
+        }
         isLoading = true
         errorMessage = nil
         output = ""
@@ -229,13 +313,15 @@ struct RewriteView: View {
             try await service.rewriteHumanizedStreaming(
                 userText: input,
                 baseURL: ollamaBaseURL,
-                model: ollamaModel
+                model: ollamaModel,
+                apiKey: ollamaAPIKey
             ) { delta in
                 await MainActor.run {
                     output += delta
                 }
             }
             lastRewriteDuration = Date().timeIntervalSince(started)
+            copyOutput()
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
@@ -257,6 +343,7 @@ struct RewriteView: View {
     }
 
     private func copyOutput() {
+        guard !trimmedOutput.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(output, forType: .string)
     }

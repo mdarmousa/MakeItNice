@@ -3,6 +3,7 @@
 //  MakeItNice
 //
 
+import CryptoKit
 import Foundation
 
 enum OllamaServiceError: LocalizedError {
@@ -36,12 +37,36 @@ struct OllamaService: Sendable {
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
+    /// Stable fingerprint for pairing cached model lists with an API key (empty when unauthenticated).
+    static func apiKeyFingerprint(_ apiKey: String) -> String {
+        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let digest = SHA256.hash(data: Data(trimmed.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func applyBearerAuth(request: inout URLRequest, apiKey: String?) {
+        let token = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !token.isEmpty else { return }
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
     static let humanizeSystemPrompt = """
-    You rewrite text so it reads like a thoughtful human wrote it, not an AI.
-    Preserve meaning and factual accuracy. Match the user’s approximate tone and register (casual vs formal) unless they gave almost no signal—then default to clear, direct prose.
-    Avoid AI clichés: stock openers, symmetrical bullet patterns for no reason, “delve”, “landscape”, “it’s important to note”, over-apologies, filler throat-clearing, and heavy em dash habits.
-    Keep formatting reasonable (paragraphs, lists only when they help). Do not add a preamble or meta commentary.
-    Output only the rewritten text.
+    You are a rewrite-only assistant. You must always answer by rewriting the user’s text and nothing else.
+
+    Mandatory output rules (violations are wrong):
+    - Respond with ONLY the rewritten text. The full reply must be paste-ready replacement for the input.
+    - Do not add any other kind of content: no introductions, titles, headings, labels (“Here’s…”, “Rewritten text:”), summaries, questions, explanations, alternatives, disclaimers, refusals, or chit-chat.
+    - Do not wrap the answer in markdown code fences or quote blocks unless the original text already used the same for that content.
+    - Do not comment on the task, the model, policies, or how you changed the text.
+
+    Rewrite goals:
+    - Make it read like capable human prose, not generic AI. Preserve meaning and factual accuracy.
+    - Match tone and register when the input gives a clear signal; otherwise use clear, direct prose.
+    - Avoid AI clichés: hollow openers, needless bullet grids, “delve”, “landscape”, “it’s worth noting”, over-apologies, throat-clearing, and decorative em dashes.
+    - Keep formatting sensible (paragraph breaks; lists only when they genuinely help).
+
+    If the input looks like a question or a command, still output only a rewritten version of that text (do not answer the question as a Q&A assistant).
     """
 
     /// Streams assistant text from `POST /api/chat` with `stream: true` (newline-delimited JSON).
@@ -50,6 +75,7 @@ struct OllamaService: Sendable {
         userText: String,
         baseURL: String,
         model: String,
+        apiKey: String? = nil,
         onDelta: @Sendable @escaping (String) async -> Void
     ) async throws {
         let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -73,6 +99,7 @@ struct OllamaService: Sendable {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        Self.applyBearerAuth(request: &request, apiKey: apiKey)
         request.httpBody = try JSONEncoder().encode(payload)
 
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
@@ -133,7 +160,7 @@ struct OllamaService: Sendable {
     }
 
     /// Lists installed model names from `GET /api/tags`.
-    func listModelNames(baseURL: String) async throws -> [String] {
+    func listModelNames(baseURL: String, apiKey: String? = nil) async throws -> [String] {
         let normalizedBase = Self.normalizedBaseURL(baseURL)
         guard let root = URL(string: normalizedBase),
               let endpoint = URL(string: "api/tags", relativeTo: root)?.absoluteURL else {
@@ -142,6 +169,7 @@ struct OllamaService: Sendable {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
+        Self.applyBearerAuth(request: &request, apiKey: apiKey)
 
         let (data, response) = try await URLSession.shared.data(for: request)
 
